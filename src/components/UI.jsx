@@ -1,13 +1,15 @@
 import { useRef } from "react";
 import { useChat } from "../hooks/useChat";
+import SpeechInput from "../hooks/speechinput";
 
 export const UI = ({ hidden, ...props }) => {
   const input = useRef();
   const { chat, loading, cameraZoomed, setCameraZoomed, message } = useChat();
 
   const sendMessage = () => {
-    const text = input.current.value;
-    if (!loading && !message) {
+    const text = input.current.value.trim();
+    
+    if (!loading && !message && text) {
       chat(text);
       input.current.value = "";
     }
@@ -92,11 +94,19 @@ export const UI = ({ hidden, ...props }) => {
             placeholder="Type a message..."
             ref={input}
             onKeyDown={(e) => {
-              if (e.key === "Enter") {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
                 sendMessage();
               }
             }}
           />
+          {/* Botón de micrófono */}
+          <SpeechInput 
+            lang="es-BO"
+            autoSend={true}
+            className="flex-shrink-0"
+          />
+          
           <button
             disabled={loading || message}
             onClick={sendMessage}
