@@ -15,6 +15,7 @@ export const ChatProvider = ({ children }) => {
       body: JSON.stringify({ message }),
     });
     const resp = (await data.json()).messages;
+    // Note: lipsync data processing removed - now handled by wawa-lipsync in frontend
     setMessages((messages) => [...messages, ...resp]);
     setLoading(false);
   };
@@ -32,6 +33,7 @@ export const ChatProvider = ({ children }) => {
     } else {
       setMessage(null);
     }
+    // Message structure now works without lipsync field - wawa-lipsync handles audio analysis
   }, [messages]);
 
   return (

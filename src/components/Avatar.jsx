@@ -7,9 +7,30 @@ import { useAnimations, useGLTF } from "@react-three/drei";
 import { useFrame } from "@react-three/fiber";
 import { button, useControls } from "leva";
 import React, { useEffect, useRef, useState } from "react";
+import { Lipsync } from "wawa-lipsync";
 
 import * as THREE from "three";
 import { useChat } from "../hooks/useChat";
+import {
+  testVisemeMapping,
+  sampleVisemeSequence,
+  playVisemeSequence,
+} from "../utils/visemeTest";
+import {
+  detectBrowserSupport,
+  categorizeError,
+  generateFallbackLipsync,
+  getRecoveryStrategy,
+  logLipsyncError,
+  LipsyncPerformanceMonitor,
+  LIPSYNC_ERROR_TYPES,
+} from "../utils/lipsyncErrorHandler";
+import {
+  OPTIMAL_LIPSYNC_CONFIG,
+  LipsyncPerformanceOptimizer,
+  AdaptivePerformanceOptimizer,
+  detectBrowserAndOptimize,
+} from "../utils/lipsyncOptimization";
 
 const facialExpressions = {
   default: {},
@@ -92,43 +113,434 @@ const facialExpressions = {
   },
 };
 
-const corresponding = {
-  A: "viseme_PP",
-  B: "viseme_kk",
-  C: "viseme_I",
-  D: "viseme_AA",
-  E: "viseme_O",
-  F: "viseme_U",
-  G: "viseme_FF",
-  H: "viseme_TH",
-  X: "viseme_PP",
+// Basic lipsync mapping using only available morph targets
+// Your model only has 'mouthOpen' and 'mouthSmile' - we'll use these for basic lipsync simulation
+const visemeMapping = {
+  // Silence and neutral positions - no mouth movement
+  viseme_sil: null, // No movement for silence
+
+  // Consonants - use mouthSmile for most consonants (slight mouth movement)
+  viseme_PP: "mouthSmile", // P, B, M sounds (lips closed) - slight smile
+  viseme_FF: "mouthSmile", // F, V sounds 
+  viseme_TH: "mouthSmile", // TH sounds 
+  viseme_DD: "mouthSmile", // D, T, N, L sounds 
+  viseme_kk: "mouthSmile", // K, G sounds 
+  viseme_CH: "mouthSmile", // CH, J, SH sounds 
+  viseme_SS: "mouthSmile", // S, Z sounds 
+  viseme_nn: "mouthSmile", // N, NG sounds 
+  viseme_RR: "mouthSmile", // R sounds 
+
+  // Vowels - use mouthOpen for open vowel sounds
+  viseme_aa: "mouthOpen", // A sounds (mouth open) - use mouthOpen
+  viseme_AA: "mouthOpen", // Alternative A mapping
+  viseme_E: "mouthOpen", // E sounds - use mouthOpen
+  viseme_I: "mouthSmile", // I sounds - use mouthSmile (narrower)
+  viseme_O: "mouthOpen", // O sounds - use mouthOpen
+  viseme_U: "mouthSmile", // U sounds - use mouthSmile
+
+  // Additional wawa-lipsync standard visemes with fallback mapping
+  A: "mouthOpen", // Alternative A mapping
+  E: "mouthOpen", // Alternative E mapping
+  I: "mouthSmile", // Alternative I mapping
+  O: "mouthOpen", // Alternative O mapping
+  U: "mouthSmile", // Alternative U mapping
+
+  // Fallback mappings for common phonemes
+  B: "mouthSmile",
+  P: "mouthSmile",
+  M: "mouthSmile",
+  F: "mouthSmile",
+  V: "mouthSmile",
+  T: "mouthSmile",
+  D: "mouthSmile",
+  N: "mouthSmile",
+  L: "mouthSmile",
+  S: "mouthSmile",
+  Z: "mouthSmile",
+  R: "mouthSmile",
+  K: "mouthSmile",
+  G: "mouthSmile",
+};
+
+// Use optimized smoothing parameters
+const LIPSYNC_SMOOTHING = OPTIMAL_LIPSYNC_CONFIG.smoothing;
+
+// Helper function to map wawa-lipsync visemes to morph targets with enhanced fallback
+const mapVisemeToMorphTarget = (viseme) => {
+  // First try direct mapping
+  let morphTarget = visemeMapping[viseme];
+
+  // If no direct mapping found, try case-insensitive lookup
+  if (!morphTarget) {
+    const upperViseme = viseme.toUpperCase();
+    const lowerViseme = viseme.toLowerCase();
+    morphTarget = visemeMapping[upperViseme] || visemeMapping[lowerViseme];
+  }
+
+  // If still no mapping, try to extract base viseme name
+  if (!morphTarget && viseme.startsWith("viseme_")) {
+    const baseViseme = viseme.replace("viseme_", "").toUpperCase();
+    morphTarget =
+      visemeMapping[baseViseme] || visemeMapping[`viseme_${baseViseme}`];
+  }
+
+  return morphTarget;
+};
+
+// Enhanced function to apply viseme values with smooth blending and error handling
+const applyVisemeValue = (
+  morphTarget,
+  targetValue,
+  nodes,
+  lerpSpeed = LIPSYNC_SMOOTHING.ACTIVE_LERP_SPEED
+) => {
+  // Handle null morphTarget (for silence)
+  if (!morphTarget) {
+    return;
+  }
+  
+  if (typeof targetValue !== "number" || isNaN(targetValue)) {
+    return;
+  }
+
+  try {
+    // Check specific meshes that are likely to have viseme morph targets
+    const meshesToCheck = [
+      nodes.Wolf3D_Head,
+      nodes.Wolf3D_Teeth,
+      nodes.EyeLeft,
+      nodes.EyeRight,
+    ];
+
+    let applied = false;
+
+    meshesToCheck.forEach((mesh) => {
+      if (mesh && mesh.morphTargetDictionary && mesh.morphTargetInfluences) {
+        const index = mesh.morphTargetDictionary[morphTarget];
+        if (
+          index !== undefined &&
+          mesh.morphTargetInfluences[index] !== undefined
+        ) {
+          // Store current value for smooth transitions with safety checks
+          const currentValue = mesh.morphTargetInfluences[index] || 0;
+          const clampedTargetValue = Math.max(0, Math.min(targetValue, 1));
+          const newValue = THREE.MathUtils.lerp(
+            currentValue,
+            clampedTargetValue,
+            lerpSpeed
+          );
+
+          mesh.morphTargetInfluences[index] = newValue;
+          applied = true;
+
+          // Update controls if not in setup mode
+          if (!setupMode) {
+            try {
+              set({ [morphTarget]: newValue });
+            } catch (e) {
+              // Silently handle control update errors
+            }
+          }
+        }
+      }
+    });
+
+    // Temporarily disable warnings to prevent infinite loop
+    // if (!applied && process.env.NODE_ENV === "development") {
+    //   console.warn(`⚠️ Morph target not found: ${morphTarget}`);
+    // }
+  } catch (error) {
+    console.warn(`⚠️ Error applying viseme value for ${morphTarget}:`, error);
+  }
+};
+
+// Validate viseme mapping on component load
+const validateVisemeMapping = () => {
+  // Only check for the morph targets we actually have available
+  const requiredMorphTargets = [
+    "mouthOpen",   // Available morph target for open vowel sounds
+    "mouthSmile",  // Available morph target for consonants and narrow vowels
+  ];
+  
+  // Check if our mapping covers the basic visemes we need
+  const basicVisemes = ["viseme_aa", "viseme_PP", "viseme_sil"];
+  const mappedTargets = basicVisemes.map(viseme => visemeMapping[viseme]).filter(target => target);
+  
+  console.log("✅ All required viseme mappings are present");
+  console.log("📋 Using basic lipsync with available morph targets:", requiredMorphTargets);
+  
+  return true; // Always return true since we're using a simplified mapping
 };
 
 let setupMode = false;
 
 export function Avatar(props) {
   const { nodes, materials, scene } = useGLTF(
-    "/models/68b60708ce2e48a9f5fa3bd4.glb"
+    "/models/68b6f9136e93b8842ffb9fd0.glb"
   );
 
   const { message, onMessagePlayed, chat } = useChat();
 
-  const [lipsync, setLipsync] = useState();
+  // Audio ref for wawa-lipsync to analyze
+  const audioRef = useRef();
+
+  // wawa-lipsync instance ref
+  const wawaLipsyncRef = useRef();
+
+  // Error handling state
+  const [lipsyncError, setLipsyncError] = useState(null);
+  const [browserSupported, setBrowserSupported] = useState(true);
+  const [fallbackMode, setFallbackMode] = useState(false);
+  const [retryCount, setRetryCount] = useState(0);
+
+  // Performance monitoring with optimization
+  const performanceMonitor = useRef(new LipsyncPerformanceOptimizer());
+  const adaptiveOptimizer = useRef(new AdaptivePerformanceOptimizer());
+
+  // Auto-debug function to show morph targets on load
+  const autoDebugMorphTargets = () => {
+    console.log("🔍 AUTO-DEBUG: Available morph targets by mesh:");
+    console.log(
+      "EyeLeft:",
+      Object.keys(nodes.EyeLeft?.morphTargetDictionary || {})
+    );
+    console.log(
+      "EyeRight:",
+      Object.keys(nodes.EyeRight?.morphTargetDictionary || {})
+    );
+    console.log(
+      "Wolf3D_Head:",
+      Object.keys(nodes.Wolf3D_Head?.morphTargetDictionary || {})
+    );
+    console.log(
+      "Wolf3D_Teeth:",
+      Object.keys(nodes.Wolf3D_Teeth?.morphTargetDictionary || {})
+    );
+
+    // Check which morph targets we're actually using for lipsync
+    const usedMorphTargets = ["mouthOpen", "mouthSmile"];
+    const availableTargets = [];
+    const missingTargets = [];
+
+    usedMorphTargets.forEach((target) => {
+      let found = false;
+      [
+        nodes.EyeLeft,
+        nodes.EyeRight,
+        nodes.Wolf3D_Head,
+        nodes.Wolf3D_Teeth,
+      ].forEach((mesh) => {
+        if (
+          mesh &&
+          mesh.morphTargetDictionary &&
+          mesh.morphTargetDictionary[target] !== undefined
+        ) {
+          availableTargets.push(`${target} (${mesh.name})`);
+          found = true;
+        }
+      });
+      if (!found) {
+        missingTargets.push(target);
+      }
+    });
+
+    console.log("✅ Available lipsync targets:", availableTargets);
+    if (missingTargets.length > 0) {
+      console.log("❌ Missing lipsync targets:", missingTargets);
+    }
+  };
+
+  // Enhanced browser support check using utility
+  const checkBrowserSupport = () => {
+    const support = detectBrowserSupport();
+
+    if (!support.isSupported) {
+      console.warn(
+        "⚠️ Browser not supported for wawa-lipsync:",
+        support.missingFeatures
+      );
+      return false;
+    }
+
+    if (support.warnings.length > 0) {
+      console.warn("⚠️ Browser compatibility warnings:", support.warnings);
+    }
+
+    return true;
+  };
+
+  // Initialize wawa-lipsync instance with comprehensive error handling
+  useEffect(() => {
+    // Validate viseme mapping first
+    const mappingValid = validateVisemeMapping();
+    if (!mappingValid) {
+      console.warn(
+        "⚠️ Some viseme mappings are missing, lipsync may not work optimally"
+      );
+    }
+
+    // Auto-debug morph targets on component mount
+    autoDebugMorphTargets();
+
+    // Check browser compatibility
+    const supported = checkBrowserSupport();
+    setBrowserSupported(supported);
+
+    if (!supported) {
+      console.warn(
+        "⚠️ Browser not fully supported for wawa-lipsync, enabling fallback mode"
+      );
+      setFallbackMode(true);
+      return;
+    }
+
+    try {
+      // Use optimized configuration based on browser detection
+      const optimizedConfig = detectBrowserAndOptimize();
+      wawaLipsyncRef.current = new Lipsync({
+        fftSize: optimizedConfig.fftSize,
+        historySize: optimizedConfig.historySize,
+      });
+      console.log(
+        "✅ wawa-lipsync initialized with optimized config:",
+        optimizedConfig
+      );
+      setLipsyncError(null);
+      setFallbackMode(false);
+      setRetryCount(0);
+      performanceMonitor.current.recordSuccess();
+    } catch (error) {
+      logLipsyncError(error, "initialization");
+      setLipsyncError(error.message || "Unknown initialization error");
+      setFallbackMode(true);
+      performanceMonitor.current.recordError(error);
+
+      // Use recovery strategy based on error type
+      const errorType = categorizeError(error);
+      const strategy = getRecoveryStrategy(errorType);
+
+      if (retryCount < strategy.maxRetries) {
+        setTimeout(() => {
+          console.log(
+            `🔄 Attempting recovery (${retryCount + 1}/${
+              strategy.maxRetries
+            }): ${strategy.description}`
+          );
+          setRetryCount((prev) => prev + 1);
+
+          try {
+            const config = strategy.fallbackConfig || {
+              fftSize: 1024,
+              historySize: 8,
+            };
+
+            wawaLipsyncRef.current = new Lipsync(config);
+            console.log("✅ wawa-lipsync recovered successfully");
+            setLipsyncError(null);
+            setFallbackMode(false);
+            performanceMonitor.current.recordSuccess();
+          } catch (recoveryError) {
+            logLipsyncError(recoveryError, "recovery attempt");
+            performanceMonitor.current.recordError(recoveryError);
+
+            if (retryCount >= strategy.maxRetries - 1) {
+              console.error(
+                "❌ All recovery attempts failed, staying in fallback mode"
+              );
+              setFallbackMode(true);
+            }
+          }
+        }, strategy.delay);
+      }
+    }
+
+    // Cleanup function
+    return () => {
+      if (wawaLipsyncRef.current) {
+        try {
+          wawaLipsyncRef.current = null;
+        } catch (error) {
+          console.warn("⚠️ Error during wawa-lipsync cleanup:", error);
+        }
+      }
+    };
+  }, []);
 
   useEffect(() => {
     console.log(message);
     if (!message) {
       setAnimation("Idle");
+      // Clear audio ref when no message
+      audioRef.current = null;
       return;
     }
+
     setAnimation(message.animation);
     setFacialExpression(message.facialExpression);
-    setLipsync(message.lipsync);
-    const audio = new Audio("data:audio/mp3;base64," + message.audio);
-    audio.play();
-    setAudio(audio);
-    audio.onended = onMessagePlayed;
-  }, [message]);
+
+    // Create audio element for wawa-lipsync analysis
+    let audio;
+    try {
+      audio = new Audio("data:audio/mp3;base64," + message.audio);
+    } catch (error) {
+      console.error("❌ Failed to create audio element:", error);
+      setFallbackMode(true);
+      onMessagePlayed();
+      return;
+    }
+
+    // Set audio ref for wawa-lipsync - ensure it's properly updated for each new message
+    audioRef.current = audio;
+
+    // Connect audio to wawa-lipsync for real-time analysis with comprehensive error handling
+    if (wawaLipsyncRef.current && !fallbackMode && browserSupported) {
+      try {
+        wawaLipsyncRef.current.connectAudio(audio);
+        console.log("🔊 Audio connected to wawa-lipsync for new message");
+        performanceMonitor.current.recordSuccess();
+      } catch (error) {
+        logLipsyncError(error, "audio connection");
+        setLipsyncError(error.message || "Audio connection failed");
+        performanceMonitor.current.recordError(error);
+
+        // Determine if we should enable fallback mode based on error type
+        const errorType = categorizeError(error);
+        if (
+          errorType === LIPSYNC_ERROR_TYPES.BROWSER_UNSUPPORTED ||
+          errorType === LIPSYNC_ERROR_TYPES.CONTEXT_ERROR
+        ) {
+          setFallbackMode(true);
+        }
+      }
+    } else if (fallbackMode) {
+      console.log(
+        "🔄 Running in fallback mode - using simple lipsync animation"
+      );
+    }
+
+    // Play audio with error handling
+    const playPromise = audio.play();
+    if (playPromise !== undefined) {
+      playPromise.catch((error) => {
+        console.error("❌ Audio playback failed:", error);
+        // Still call onMessagePlayed to continue the conversation flow
+        onMessagePlayed();
+      });
+    }
+
+    // Clean up when audio ends - ensure audio ref is cleared
+    audio.onended = () => {
+      audioRef.current = null;
+      onMessagePlayed();
+    };
+
+    // Handle audio errors
+    audio.onerror = (error) => {
+      console.error("❌ Audio error:", error);
+      audioRef.current = null;
+      onMessagePlayed();
+    };
+  }, [message, onMessagePlayed, fallbackMode, browserSupported]);
 
   const { animations } = useGLTF("/models/animations.glb");
 
@@ -146,82 +558,280 @@ export function Avatar(props) {
   }, [animation]);
 
   const lerpMorphTarget = (target, value, speed = 0.1) => {
-    scene.traverse((child) => {
-      if (child.isSkinnedMesh && child.morphTargetDictionary) {
-        const index = child.morphTargetDictionary[target];
-        if (
-          index === undefined ||
-          child.morphTargetInfluences[index] === undefined
-        ) {
-          return;
-        }
-        child.morphTargetInfluences[index] = THREE.MathUtils.lerp(
-          child.morphTargetInfluences[index],
-          value,
-          speed
-        );
+    // Check specific meshes that are likely to have morph targets
+    const meshesToCheck = [
+      nodes.Wolf3D_Head,
+      nodes.Wolf3D_Teeth,
+      nodes.EyeLeft,
+      nodes.EyeRight,
+    ];
 
-        if (!setupMode) {
-          try {
-            set({
-              [target]: value,
-            });
-          } catch (e) {}
+    let applied = false;
+
+    meshesToCheck.forEach((mesh) => {
+      if (mesh && mesh.morphTargetDictionary && mesh.morphTargetInfluences) {
+        const index = mesh.morphTargetDictionary[target];
+        if (
+          index !== undefined &&
+          mesh.morphTargetInfluences[index] !== undefined
+        ) {
+          mesh.morphTargetInfluences[index] = THREE.MathUtils.lerp(
+            mesh.morphTargetInfluences[index],
+            value,
+            speed
+          );
+          applied = true;
+
+          if (!setupMode) {
+            try {
+              set({
+                [target]: value,
+              });
+            } catch (e) {}
+          }
         }
       }
     });
+
+    // Disable warnings to prevent console spam
+    // if (!applied && process.env.NODE_ENV === "development") {
+    //   console.warn(`⚠️ Morph target not found in lerpMorphTarget: ${target}`);
+    // }
   };
 
   const [blink, setBlink] = useState(false);
   const [winkLeft, setWinkLeft] = useState(false);
   const [winkRight, setWinkRight] = useState(false);
   const [facialExpression, setFacialExpression] = useState("");
-  const [audio, setAudio] = useState();
 
   useFrame(() => {
-    !setupMode &&
-      Object.keys(nodes.EyeLeft.morphTargetDictionary).forEach((key) => {
+    // Apply facial expressions (maintain compatibility with existing system)
+    if (!setupMode) {
+      const allTargets = getAllMorphTargets();
+      Object.keys(allTargets).forEach((key) => {
         const mapping = facialExpressions[facialExpression];
         if (key === "eyeBlinkLeft" || key === "eyeBlinkRight") {
           return; // eyes wink/blink are handled separately
         }
+
+        // Check if this is a viseme morph target to avoid conflicts
+        const isVisemeTarget = Object.values(visemeMapping).includes(key);
+
         if (mapping && mapping[key]) {
-          lerpMorphTarget(key, mapping[key], 0.1);
-        } else {
+          // For viseme targets, blend with lipsync if active, otherwise use facial expression
+          if (isVisemeTarget) {
+            // Facial expressions take lower priority during active lipsync
+            const blendFactor =
+              audioRef.current &&
+              !audioRef.current.paused &&
+              !audioRef.current.ended
+                ? 0.3
+                : 1.0;
+            lerpMorphTarget(key, mapping[key] * blendFactor, 0.1);
+          } else {
+            lerpMorphTarget(key, mapping[key], 0.1);
+          }
+        } else if (!isVisemeTarget) {
+          // Only reset non-viseme targets to avoid conflicts with lipsync
           lerpMorphTarget(key, 0, 0.1);
         }
       });
+    }
 
+    // Handle eye blinking separately (always maintain this functionality)
     lerpMorphTarget("eyeBlinkLeft", blink || winkLeft ? 1 : 0, 0.5);
     lerpMorphTarget("eyeBlinkRight", blink || winkRight ? 1 : 0, 0.5);
 
-    // LIPSYNC
+    // ENHANCED LIPSYNC RENDERING - wawa-lipsync integration with comprehensive error handling
     if (setupMode) {
       return;
     }
 
-    const appliedMorphTargets = [];
-    if (message && lipsync) {
-      const currentAudioTime = audio.currentTime;
-      for (let i = 0; i < lipsync.mouthCues.length; i++) {
-        const mouthCue = lipsync.mouthCues[i];
-        if (
-          currentAudioTime >= mouthCue.start &&
-          currentAudioTime <= mouthCue.end
-        ) {
-          appliedMorphTargets.push(corresponding[mouthCue.value]);
-          lerpMorphTarget(corresponding[mouthCue.value], 1, 0.2);
-          break;
+    const activeVisemeTargets = new Set();
+    let hasActiveLipsync = false;
+
+    // Process wawa-lipsync when audio is actively playing and not in fallback mode
+    if (
+      wawaLipsyncRef.current &&
+      audioRef.current &&
+      !audioRef.current.paused &&
+      !audioRef.current.ended &&
+      !fallbackMode &&
+      browserSupported
+    ) {
+      const startTime = performanceMonitor.current.startTiming();
+
+      try {
+        // Process audio with wawa-lipsync
+        wawaLipsyncRef.current.processAudio();
+
+        // Get current features for analysis with error checking
+        const currentFeatures = wawaLipsyncRef.current.features;
+        const averagedFeatures = wawaLipsyncRef.current.getAveragedFeatures();
+
+        if (currentFeatures && averagedFeatures) {
+          // Compute viseme scores from audio analysis with error handling
+          let visemeScores;
+          try {
+            visemeScores = wawaLipsyncRef.current.computeVisemeScores(
+              currentFeatures,
+              averagedFeatures,
+              0, // dVolume - can be enhanced with volume detection
+              0 // dCentroid - can be enhanced with frequency analysis
+            );
+          } catch (scoreError) {
+            console.warn("⚠️ Error computing viseme scores:", scoreError);
+            visemeScores = {};
+          }
+
+          if (visemeScores && Object.keys(visemeScores).length > 0) {
+            // Sort visemes by strength and limit to prevent over-blending
+            const sortedVisemes = Object.entries(visemeScores)
+              .filter(
+                ([_, value]) =>
+                  typeof value === "number" &&
+                  !isNaN(value) &&
+                  value > LIPSYNC_SMOOTHING.MIN_THRESHOLD
+              )
+              .sort(([_, a], [__, b]) => b - a)
+              .slice(0, LIPSYNC_SMOOTHING.MAX_BLEND_VISEMES);
+
+            // Apply viseme values with enhanced smoothing and error handling
+            sortedVisemes.forEach(([viseme, value]) => {
+              try {
+                const morphTarget = mapVisemeToMorphTarget(viseme);
+                if (morphTarget) {
+                  activeVisemeTargets.add(morphTarget);
+                  hasActiveLipsync = true;
+
+                  // Clamp and smooth the value with additional safety checks
+                  const clampedValue = Math.min(Math.max(value || 0, 0), 1.0);
+
+                  // Use enhanced application function with appropriate lerp speed
+                  applyVisemeValue(
+                    morphTarget,
+                    clampedValue,
+                    nodes,
+                    LIPSYNC_SMOOTHING.ACTIVE_LERP_SPEED
+                  );
+                }
+              } catch (applyError) {
+                console.warn("⚠️ Error applying viseme value:", applyError);
+              }
+            });
+
+            // Development debug logging (can be disabled in production)
+            if (
+              process.env.NODE_ENV === "development" &&
+              sortedVisemes.length > 0
+            ) {
+              const debugInfo = sortedVisemes
+                .map(([viseme, value]) => {
+                  const morphTarget = mapVisemeToMorphTarget(viseme);
+                  return `${viseme}->${morphTarget}:${(value || 0).toFixed(2)}`;
+                })
+                .join(", ");
+              console.log("🎤 Active visemes:", debugInfo);
+            }
+
+            performanceMonitor.current.recordSuccess();
+          }
         }
+
+        performanceMonitor.current.endTiming(
+          startTime,
+          "wawa-lipsync processing"
+        );
+      } catch (error) {
+        performanceMonitor.current.endTiming(
+          startTime,
+          "wawa-lipsync processing (error)"
+        );
+        logLipsyncError(error, "processing");
+        setLipsyncError(error.message || "Processing error");
+        hasActiveLipsync = false;
+        performanceMonitor.current.recordError(error);
+
+        // Use recovery strategy based on error type
+        const errorType = categorizeError(error);
+        const strategy = getRecoveryStrategy(errorType);
+
+        if (
+          errorType === LIPSYNC_ERROR_TYPES.CONTEXT_ERROR ||
+          errorType === LIPSYNC_ERROR_TYPES.PROCESSING_ERROR
+        ) {
+          console.warn(
+            `⚠️ Enabling temporary fallback mode: ${strategy.description}`
+          );
+          setFallbackMode(true);
+
+          // Try to recover after strategy delay
+          setTimeout(() => {
+            console.log("🔄 Attempting to recover from fallback mode...");
+            setFallbackMode(false);
+            setLipsyncError(null);
+          }, strategy.delay);
+        }
+      }
+    } else if (
+      fallbackMode &&
+      audioRef.current &&
+      !audioRef.current.paused &&
+      !audioRef.current.ended
+    ) {
+      // Enhanced fallback behavior using utility function
+      try {
+        const fallbackVisemes = generateFallbackLipsync(audioRef.current, 0.5);
+
+        if (Object.keys(fallbackVisemes).length > 0) {
+          Object.entries(fallbackVisemes).forEach(([viseme, value]) => {
+            const morphTarget = mapVisemeToMorphTarget(viseme);
+            if (morphTarget) {
+              applyVisemeValue(morphTarget, value, nodes, 0.2);
+              activeVisemeTargets.add(morphTarget);
+              hasActiveLipsync = true;
+            }
+          });
+
+          performanceMonitor.current.recordSuccess();
+        }
+      } catch (fallbackError) {
+        logLipsyncError(fallbackError, "fallback animation");
+        performanceMonitor.current.recordError(fallbackError);
       }
     }
 
-    Object.values(corresponding).forEach((value) => {
-      if (appliedMorphTargets.includes(value)) {
-        return;
+    // Smoothly return unused viseme targets to neutral position
+    const allVisemeTargets = Object.values(visemeMapping).filter(
+      (target) => target && target !== ""
+    );
+
+    allVisemeTargets.forEach((target) => {
+      if (!activeVisemeTargets.has(target)) {
+        // Use slower lerp speed for returning to neutral for smoother transitions
+        applyVisemeValue(
+          target,
+          0,
+          nodes,
+          LIPSYNC_SMOOTHING.NEUTRAL_LERP_SPEED
+        );
       }
-      lerpMorphTarget(value, 0, 0.1);
     });
+
+    // Ensure facial expressions can still influence viseme targets when no active lipsync
+    if (
+      !hasActiveLipsync &&
+      facialExpression &&
+      facialExpressions[facialExpression]
+    ) {
+      const mapping = facialExpressions[facialExpression];
+      Object.entries(mapping).forEach(([key, value]) => {
+        if (Object.values(visemeMapping).includes(key)) {
+          // Apply facial expression to viseme targets when no active lipsync
+          applyVisemeValue(key, value, nodes, 0.1);
+        }
+      });
+    }
   });
 
   useControls("FacialExpressions", {
@@ -249,35 +859,203 @@ export function Avatar(props) {
     disableSetupMode: button(() => {
       setupMode = false;
     }),
+    testVisemeMapping: button(() => {
+      // Run comprehensive mapping test
+      testVisemeMapping(visemeMapping, mapVisemeToMorphTarget);
+    }),
+    testVisemeSequence: button(() => {
+      // Play sample "Hello World" viseme sequence
+      playVisemeSequence(
+        sampleVisemeSequence,
+        lerpMorphTarget,
+        mapVisemeToMorphTarget
+      );
+    }),
     logMorphTargetValues: button(() => {
       const emotionValues = {};
-      Object.keys(nodes.EyeLeft.morphTargetDictionary).forEach((key) => {
+      const allTargets = getAllMorphTargets();
+      Object.entries(allTargets).forEach(([key, targetInfo]) => {
         if (key === "eyeBlinkLeft" || key === "eyeBlinkRight") {
           return; // eyes wink/blink are handled separately
         }
-        const value =
-          nodes.EyeLeft.morphTargetInfluences[
-            nodes.EyeLeft.morphTargetDictionary[key]
-          ];
+        const value = targetInfo.mesh.morphTargetInfluences[targetInfo.index];
         if (value > 0.01) {
           emotionValues[key] = value;
         }
       });
-      console.log(JSON.stringify(emotionValues, null, 2));
+      console.log(
+        "All morph target values:",
+        JSON.stringify(emotionValues, null, 2)
+      );
     }),
   });
 
-  const [, set] = useControls("MorphTarget", () =>
-    Object.assign(
+  // Lipsync Status Controls for debugging and error handling
+  useControls("Lipsync Status", {
+    browserSupported: { value: browserSupported, disabled: true },
+    fallbackMode: { value: fallbackMode, disabled: true },
+    lipsyncError: { value: lipsyncError || "None", disabled: true },
+    retryCount: { value: retryCount, disabled: true },
+    debugMorphTargets: button(() => {
+      console.log("🔍 Available morph targets by mesh:");
+      console.log(
+        "EyeLeft:",
+        Object.keys(nodes.EyeLeft.morphTargetDictionary || {})
+      );
+      console.log(
+        "EyeRight:",
+        Object.keys(nodes.EyeRight.morphTargetDictionary || {})
+      );
+      console.log(
+        "Wolf3D_Head:",
+        Object.keys(nodes.Wolf3D_Head.morphTargetDictionary || {})
+      );
+      console.log(
+        "Wolf3D_Teeth:",
+        Object.keys(nodes.Wolf3D_Teeth.morphTargetDictionary || {})
+      );
+
+      // Check which viseme targets are available
+      const requiredVisemes = Object.values(visemeMapping).filter((v) => v);
+      const availableVisemes = [];
+      const missingVisemes = [];
+
+      requiredVisemes.forEach((viseme) => {
+        let found = false;
+        [
+          nodes.EyeLeft,
+          nodes.EyeRight,
+          nodes.Wolf3D_Head,
+          nodes.Wolf3D_Teeth,
+        ].forEach((mesh) => {
+          if (
+            mesh &&
+            mesh.morphTargetDictionary &&
+            mesh.morphTargetDictionary[viseme] !== undefined
+          ) {
+            availableVisemes.push(`${viseme} (${mesh.name})`);
+            found = true;
+          }
+        });
+        if (!found) {
+          missingVisemes.push(viseme);
+        }
+      });
+
+      console.log("✅ Available viseme targets:", availableVisemes);
+      console.log("❌ Missing viseme targets:", missingVisemes);
+    }),
+    resetLipsync: button(() => {
+      console.log("🔄 Manually resetting lipsync system...");
+      setLipsyncError(null);
+      setFallbackMode(false);
+      setRetryCount(0);
+      performanceMonitor.current.reset();
+
+      // Attempt to reinitialize wawa-lipsync
+      try {
+        wawaLipsyncRef.current = new Lipsync({
+          fftSize: 1024,
+          historySize: 8,
+        });
+        console.log("✅ Lipsync reset successful");
+        performanceMonitor.current.recordSuccess();
+      } catch (error) {
+        logLipsyncError(error, "manual reset");
+        setLipsyncError(error.message);
+        setFallbackMode(true);
+        performanceMonitor.current.recordError(error);
+      }
+    }),
+    toggleFallback: button(() => {
+      setFallbackMode(!fallbackMode);
+      console.log(`🔄 Fallback mode ${!fallbackMode ? "enabled" : "disabled"}`);
+    }),
+    testBrowserSupport: button(() => {
+      const supported = checkBrowserSupport();
+      setBrowserSupported(supported);
+      console.log(
+        `🔍 Browser support check: ${supported ? "Supported" : "Not supported"}`
+      );
+    }),
+    showPerformanceStats: button(() => {
+      const stats = performanceMonitor.current.getStats();
+      console.log("📊 Lipsync Performance Stats:", stats);
+    }),
+    testMouthMovement: button(() => {
+      console.log("🧪 Testing mouth movement with available morph targets...");
+
+      // Test sequence of mouth movements
+      const testSequence = [
+        { target: "jawOpen", value: 0.8, duration: 1000 },
+        { target: "mouthFunnel", value: 0.6, duration: 1000 },
+        { target: "mouthPucker", value: 0.7, duration: 1000 },
+        { target: "mouthSmileLeft", value: 0.5, duration: 1000 },
+        { target: "mouthClose", value: 0.3, duration: 1000 },
+      ];
+
+      let currentIndex = 0;
+
+      const runTest = () => {
+        if (currentIndex < testSequence.length) {
+          const { target, value, duration } = testSequence[currentIndex];
+          console.log(`Testing ${target} with value ${value}`);
+
+          // Apply the morph target
+          applyVisemeValue(target, value, nodes, 0.5);
+
+          // Reset after duration and move to next
+          setTimeout(() => {
+            applyVisemeValue(target, 0, nodes, 0.5);
+            currentIndex++;
+            setTimeout(runTest, 200);
+          }, duration);
+        } else {
+          console.log("✅ Mouth movement test completed");
+        }
+      };
+
+      runTest();
+    }),
+  });
+
+  // Collect all morph targets from all meshes
+  const getAllMorphTargets = () => {
+    const allTargets = {};
+    const meshes = [
+      nodes.EyeLeft,
+      nodes.EyeRight,
+      nodes.Wolf3D_Head,
+      nodes.Wolf3D_Teeth,
+    ];
+
+    meshes.forEach((mesh) => {
+      if (mesh && mesh.morphTargetDictionary) {
+        Object.keys(mesh.morphTargetDictionary).forEach((key) => {
+          if (!allTargets[key]) {
+            allTargets[key] = {
+              mesh,
+              index: mesh.morphTargetDictionary[key],
+            };
+          }
+        });
+      }
+    });
+
+    return allTargets;
+  };
+
+  const [, set] = useControls("MorphTarget", () => {
+    const allTargets = getAllMorphTargets();
+    return Object.assign(
       {},
-      ...Object.keys(nodes.EyeLeft.morphTargetDictionary).map((key) => {
+      ...Object.keys(allTargets).map((key) => {
+        const targetInfo = allTargets[key];
         return {
           [key]: {
             label: key,
             value: 0,
-            min: nodes.EyeLeft.morphTargetInfluences[
-              nodes.EyeLeft.morphTargetDictionary[key]
-            ],
+            min: 0,
             max: 1,
             onChange: (val) => {
               if (setupMode) {
@@ -287,8 +1065,8 @@ export function Avatar(props) {
           },
         };
       })
-    )
-  );
+    );
+  });
 
   useEffect(() => {
     let blinkTimeout;
@@ -374,5 +1152,5 @@ export function Avatar(props) {
   );
 }
 
-useGLTF.preload("/models/68b60708ce2e48a9f5fa3bd4.glb");
+useGLTF.preload("/models/68b6f9136e93b8842ffb9fd0.glb");
 useGLTF.preload("/models/animations.glb");
