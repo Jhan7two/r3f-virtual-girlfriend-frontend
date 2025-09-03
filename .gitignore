@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+.kiro/
+ELEVENLABS_SETUP_GUIDE.md
+INTEGRATION_TESTS_SUMMARY.md
